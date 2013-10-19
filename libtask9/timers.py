@@ -1,10 +1,11 @@
 import sys
 import math
 import errno
-import select
+import signal
 import logging
 from .task import new_proc, new_task
 from .channel import Channel, alt, alt_recv
+import _libtask9_timers
 
 class _Event(object):
     def __init__(self, timeout, reply_chan):
@@ -16,6 +17,7 @@ class _Event(object):
 
 class _Timers(object):
     def __init__(self):
+        self.tid = None # POSIX -lrt timer id
         self.events = []
         self.events_guard = _Event(sys.maxint, Channel(0))
         self.events.append(self.events_guard)
@@ -24,6 +26,8 @@ class _Timers(object):
 
     def start(self):
         new_proc(self.ticker_proc, procname='ticker_proc', main_proc=False)
+        self.tid = _libtask9_timers.start_ticker(1)
+        logging.debug('timerid: {}'.format(str(self.tid)))
         new_task(self.timers_maintask)
 
     def register_timer(self, timeout):
@@ -34,13 +38,8 @@ class _Timers(object):
 
     def ticker_proc(self):
         while True:
-            try:
-                select.select([], [], [], 1.0)
-                self.tick.send(True)
-            except select.error as e:
-                if e.errno == errno.EINTR:
-                    continue
-                raise
+            ticks = _libtask9_timers.wait_tick()
+            self.tick.nbsend(ticks)
 
     def timers_maintask(self):
         while True:
@@ -51,14 +50,16 @@ class _Timers(object):
             )
 
             if idx == 0:
-                logging.debug('tick, events: {}'.format(self.events))
-                while self.events[0] != self.events_guard:
+                ticks = result
+                logging.debug('ticks: {}, events: {}'.format(ticks, self.events))
+                for i in range(ticks):
+                    if self.events[0] == self.events_guard:
+                        break
+
                     self.events[0].timeout -= 1
                     if self.events[0].timeout <= 0:
                         event = self.events.pop(0)
                         event.reply_chan.send(True)
-                    else:
-                        break
 
             elif idx == 1:
                 self._add_event(result)
@@ -76,11 +77,20 @@ class _Timers(object):
 
         logging.debug('events: {}'.format(self.events))
 
-_timers = _Timers()
-_timers.start()
+_timers = None
+
+def init_timers():
+    global _timers
+    if _timers is not None:
+        raise RuntimeError('libtask9 timers are already initialized')
+    _libtask9_timers.mask_sigvtalrm()
+    _timers = _Timers()
+    _timers.start()
 
 def after(timeout):
     global _timers
+    if _timers is None:
+        raise RuntimeError('libtask9 timers were not initialized')
     return _timers.register_timer(timeout)
 
 def sleep(timeout):
